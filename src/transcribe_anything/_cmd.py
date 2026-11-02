@@ -263,6 +263,18 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
+        "--playlist",
+        help=(
+            "Explicit playlist mode: path to a manifest file (.json/.txt/.m3u) listing "
+            "multiple urls/files. Entries are frozen in manifest order, transcribed one "
+            "at a time into independent per-item folders under --output_dir, and indexed "
+            "in playlist_index.json. Duplicate titles never overwrite each other; a "
+            "missing/unavailable entry is recorded in the index and does not stop the rest. "
+            "Mutually exclusive with a positional url/file and with --stream-in."
+        ),
+        default=None,
+    )
+    parser.add_argument(
         "--stream-in",
         action="store_true",
         help=(
@@ -274,7 +286,13 @@ def parse_arguments() -> argparse.Namespace:
     )
     # add extra options that are passed into the transcribe function
     args, unknown = parser.parse_known_args()
-    if args.url_or_file is None and args.query_gpu_json_path is None and not getattr(args, "clear_nvidia_cache", False) and not getattr(args, "stream_in", False):
+    if (
+        args.url_or_file is None
+        and args.query_gpu_json_path is None
+        and not getattr(args, "clear_nvidia_cache", False)
+        and not getattr(args, "stream_in", False)
+        and not getattr(args, "playlist", None)
+    ):
         print("No file or url provided")
         parser.print_help()
         sys.exit(1)
@@ -383,7 +401,8 @@ def main() -> int:
 
     if unknown:
         print(f"Args passed to whisper backend: {unknown}")
-    print(f"Running transcribe_audio on {args.url_or_file}")
+    if not getattr(args, "playlist", None):
+        print(f"Running transcribe_audio on {args.url_or_file}")
 
     from transcribe_anything.client import resolve_remote_and_token
 
@@ -391,6 +410,89 @@ def main() -> int:
         remote_arg=getattr(args, "remote", None),
         token_arg=getattr(args, "token", None),
     )
+
+    if getattr(args, "playlist", None):
+        # Explicit playlist mode: freeze entry identities/order first, then
+        # drive the existing single-item backend once per entry. Single-file
+        # mode below this branch is unchanged.
+        if args.url_or_file:
+            print("Error: --playlist cannot be combined with a positional url/file")
+            return 1
+        if getattr(args, "stream_in", False):
+            print("Error: --playlist cannot be combined with --stream-in")
+            return 1
+        playlist_path = args.playlist
+        if not os.path.isfile(playlist_path):
+            print(f"Error: playlist manifest not found: {playlist_path}")
+            return 1
+
+        from transcribe_anything.playlist import run_playlist_manifest
+        from transcribe_anything.util import sanitize_filename
+
+        collection_dir = args.output_dir or ("text_playlist_" + sanitize_filename(os.path.splitext(os.path.basename(playlist_path))[0]))
+        model_value = args.model if args.model != "None" else None
+        language_value = args.language if args.language != "None" else None
+
+        if remote:
+            from transcribe_anything.client import transcribe_remote
+
+            def _playlist_backend(source: str, item_output_dir: str) -> str:
+                return transcribe_remote(
+                    url_or_file=source,
+                    remote=remote,
+                    output_dir=item_output_dir,
+                    token=token,
+                    model=model_value,
+                    task=args.task,
+                    language=language_value,
+                    initial_prompt=args.initial_prompt,
+                    align=align,
+                    align_model=align_model if align else None,
+                    other_args=unknown,
+                    embed=args.embed,
+                )
+
+        else:
+            from transcribe_anything.api import transcribe as transcribe_single
+
+            def _playlist_backend(source: str, item_output_dir: str) -> str:
+                return transcribe_single(
+                    url_or_file=source,
+                    output_dir=item_output_dir,
+                    model=model_value,
+                    task=args.task,
+                    language=language_value,
+                    device=args.device,
+                    embed=args.embed,
+                    hugging_face_token=args.hf_token,
+                    other_args=unknown,
+                    align=align,
+                    align_model=align_model if align else None,
+                )
+
+        print(f"Running explicit playlist from {playlist_path}")
+        try:
+            playlist_result = run_playlist_manifest(
+                playlist_path,
+                collection_dir,
+                transcribe_fn=_playlist_backend,
+            )
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt")
+            return 1
+        except Exception as e:  # pylint: disable=broad-except
+            stack = traceback.format_exc()
+            sys.stderr.write(f"Error: {e}\n{stack}\nwhile processing playlist {playlist_path}\n")
+            return 1
+        if playlist_result.has_errors:
+            sys.stderr.write(
+                f"Playlist completed with {playlist_result.unavailable_count} unavailable and "
+                f"{playlist_result.failed_count} failed out of {len(playlist_result.items)} entries. "
+                f"See index: {playlist_result.index_path}\n"
+            )
+            return 1
+        return 0
+
     if remote and getattr(args, "stream_in", False):
         from transcribe_anything.client import (
             RemoteTranscriberError,
